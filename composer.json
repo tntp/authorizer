@@ -1,0 +1,7 @@
+{
+    "name": "tntp/authorizer",
+    "type": "project",
+    "require": {
+        "freedsx/ldap": "^0.4.0"
+    }
+}
