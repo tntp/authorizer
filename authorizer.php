@@ -1469,7 +1469,7 @@ if ( ! class_exists( 'WP_Plugin_Authorizer' ) ) {
 			$bind_password = null;
 			if ( strlen( $auth_settings['ldap_user'] ) > 0 ) {
 				$bind_rdn      = $auth_settings['ldap_user'];
-				$bind_password = $result = $this->decrypt_compat( $auth_settings['ldap_password'] );
+				$bind_password = $result = $this->decrypt( $auth_settings['ldap_password'] );
 				if (is_wp_error( $result ))
 					return $result;
 			}
@@ -1688,7 +1688,7 @@ if ( ! class_exists( 'WP_Plugin_Authorizer' ) ) {
 			$bind_password = null;
 			if ( strlen( $auth_settings['ldap_user'] ) > 0 ) {
 				$bind_rdn      = $auth_settings['ldap_user'];
-				$bind_password = $this->decrypt_compat( $auth_settings['ldap_password'] );
+				$bind_password = $this->decrypt( $auth_settings['ldap_password'] );
 			}
 
 			// Attempt LDAP bind.
@@ -3635,9 +3635,8 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Obfuscate LDAP directory user password.
 			if ( strlen( $auth_settings['ldap_password'] ) > 0 ) {
-				error_log('Encrypting password during sanitize_options');
 				// encrypt the directory user password for some minor obfuscation in the database.
-				$auth_settings['ldap_password'] = $this->encrypt_compat( $auth_settings['ldap_password'] );
+				$auth_settings['ldap_password'] = $this->encrypt( $auth_settings['ldap_password'] );
 			}
 
 			// Sanitize LDAP attribute update (checkbox: value can only be '1' or empty string).
@@ -5282,7 +5281,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 			// Print option elements.
 			?>
 			<input type="password" id="garbage_to_stop_autofill" name="garbage" value="" autocomplete="off" style="display:none;" />
-			<input type="password" id="auth_settings_<?php echo esc_attr( $option ); ?>" name="auth_settings[<?php echo esc_attr( $option ); ?>]" value="<?php echo esc_attr( $this->decrypt_compat( $auth_settings_option ) ); ?>" autocomplete="new-password" />
+			<input type="password" id="auth_settings_<?php echo esc_attr( $option ); ?>" name="auth_settings[<?php echo esc_attr( $option ); ?>]" value="<?php echo esc_attr( $this->decrypt( $auth_settings_option ) ); ?>" autocomplete="new-password" />
 			<?php
 		}
 
@@ -7518,35 +7517,6 @@ function signInCallback( authResult ) { // jshint ignore:line
 		 */
 		private static $iv = 'R_O2D]jPn]1[fhJl!-P1.oe';
 
-		function encrypt_compat($data)
-		{
-			$l = strlen(self::$key);
-			if ($l < 16)
-				$key = str_repeat(self::$key, ceil(16/$l));
-	
-			if ($m = strlen($data)%8)
-				$data .= str_repeat("\x00",  8 - $m);
-			if (function_exists('mcrypt_encrypt'))
-				$val = mcrypt_encrypt(MCRYPT_BLOWFISH, self::$key, addslashes($data), MCRYPT_MODE_ECB);
-			else
-				$val = openssl_encrypt(addslashes($data), 'BF-ECB', self::$key, OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
-	
-			return base64_encode($val);
-		}
-	
-		function decrypt_compat($data)
-		{
-			$l = strlen(self::$key);
-			if ($l < 16)
-				$key = str_repeat(self::$key, ceil(16/$l));
-	
-			if (function_exists('mcrypt_encrypt'))
-				$val = mcrypt_decrypt(MCRYPT_BLOWFISH, self::$key, base64_decode($data), MCRYPT_MODE_ECB);
-			else
-				$val = openssl_decrypt(base64_decode($data), 'BF-ECB', self::$key, OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
-			return stripslashes($val);
-		}
-
 		/**
 		 * Basic encryption using a public (not secret!) key. Used for general
 		 * database obfuscation of passwords.
@@ -7560,7 +7530,6 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Use openssl library (better) if it is enabled.
 			if ( function_exists( 'openssl_encrypt' ) && 'openssl' === $library ) {
-				error_log('Encrypting using openssl');
 				$result = base64_encode(
 					openssl_encrypt(
 						$text,
@@ -7571,10 +7540,8 @@ function signInCallback( authResult ) { // jshint ignore:line
 					)
 				);
 			} elseif ( function_exists( 'mcrypt_encrypt' ) ) { // Use mcrypt library (deprecated in PHP 7.1) if php5-mcrypt extension is enabled.
-				error_log('Encrypting using mcrypt');
 				$result = base64_encode( mcrypt_encrypt( MCRYPT_RIJNDAEL_256, self::$key, $text, MCRYPT_MODE_ECB, 'abcdefghijklmnopqrstuvwxyz012345' ) );
 			} else { // Fall back to basic obfuscation.
-				error_log('Encrypting using basic authentication');
 				$length = strlen( $text );
 				for ( $i = 0; $i < $length; $i++ ) {
 					$char    = substr( $text, $i, 1 );
@@ -7602,7 +7569,6 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Use openssl library (better) if it is enabled.
 			if ( function_exists( 'openssl_decrypt' ) && 'openssl' === $library ) {
-				error_log('Decrypting using openssl');
 				$result = openssl_decrypt(
 					base64_decode( $secret ),
 					'AES-256-CBC',
@@ -7611,11 +7577,9 @@ function signInCallback( authResult ) { // jshint ignore:line
 					substr( hash( 'sha256', self::$iv ), 0, 16 )
 				);
 			} elseif ( function_exists( 'mcrypt_decrypt' ) ) { // Use mcrypt library (deprecated in PHP 7.1) if php5-mcrypt extension is enabled.
-				error_log('Decrypting using mcrypt');
 				$secret = base64_decode( $secret );
 				$result = rtrim( mcrypt_decrypt( MCRYPT_RIJNDAEL_256, self::$key, $secret, MCRYPT_MODE_ECB, 'abcdefghijklmnopqrstuvwxyz012345' ), "\0$result" );
 			} else { // Fall back to basic obfuscation.
-				error_log('Decrypting using basic authentication');
 				$secret = base64_decode( $secret );
 				$length = strlen( $secret );
 				for ( $i = 0; $i < $length; $i++ ) {
@@ -7626,7 +7590,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 				}
 			}
 
-			return $result;
+			return stripslashes($result);
 		}
 
 
@@ -8133,7 +8097,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 						$auth_settings = get_blog_option( $blog_id, 'auth_settings', array() );
 						if ( array_key_exists( 'ldap_password', $auth_settings ) && strlen( $auth_settings['ldap_password'] ) > 0 ) {
 							$plaintext_ldap_password        = $this->decrypt( $auth_settings['ldap_password'], 'mcrypt' );
-							$auth_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
+							$auth_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
 							update_blog_option( $blog_id, 'auth_settings', $auth_settings );
 						}
 					}
@@ -8142,7 +8106,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 					$auth_settings = get_option( 'auth_settings', array() );
 					if ( array_key_exists( 'ldap_password', $auth_settings ) && strlen( $auth_settings['ldap_password'] ) > 0 ) {
 						$plaintext_ldap_password        = $this->decrypt( $auth_settings['ldap_password'], 'mcrypt' );
-						$auth_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
+						$auth_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
 						update_option( 'auth_settings', $auth_settings );
 					}
 				}
@@ -8161,7 +8125,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 					$auth_multisite_settings = get_blog_option( $this->current_site_blog_id, 'auth_multisite_settings', array() );
 					if ( array_key_exists( 'ldap_password', $auth_multisite_settings ) && strlen( $auth_multisite_settings['ldap_password'] ) > 0 ) {
 						$plaintext_ldap_password                  = $this->decrypt( $auth_multisite_settings['ldap_password'], 'mcrypt' );
-						$auth_multisite_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
+						$auth_multisite_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
 						update_blog_option( $this->current_site_blog_id, 'auth_multisite_settings', $auth_multisite_settings );
 					}
 				}
