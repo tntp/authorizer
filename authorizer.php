@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name: Authorizer
+ * Plugin Name: Authorizer (TNTP)
  * Description: Authorizer limits login attempts, restricts access to specified users, and authenticates against external sources (e.g., Google, LDAP, or CAS).
- * Author: Paul Ryan <prar@hawaii.edu>
+ * Author: Paul Ryan <prar@hawaii.edu>, Zay Collier <zay.collier@tntp.org>
  * Plugin URI: https://github.com/uhm-coe/authorizer
  * Text Domain: authorizer
  * Domain Path: /languages
@@ -17,6 +17,12 @@
  * Portions forked from wpCAS plugin: http://wordpress.org/extend/plugins/cas-authentication/
  * Portions forked from Limit Login Attempts: http://wordpress.org/plugins/limit-login-attempts/
  */
+
+require_once dirname( __FILE__ ) . '/vendor/autoload.php';
+
+use FreeDSx\Ldap\LdapClient;
+use FreeDSx\Ldap\Operations;
+use FreeDSx\Ldap\Search\Filters;
 
 /**
  * Add phpCAS library if it's not included.
@@ -1416,6 +1422,225 @@ if ( ! class_exists( 'WP_Plugin_Authorizer' ) ) {
 				return new WP_Error( 'empty_password', __( 'You must provide a password.', 'authorizer' ) );
 			}
 
+			// Authenticate against LDAP using options provided in plugin settings.
+			$result       = false;
+			$ldap_user_dn = '';
+			$first_name   = '';
+			$last_name    = '';
+			$email        = '';
+
+			// Construct LDAP connection parameters. ldap_connect() takes either a
+			// hostname or a full LDAP URI as its first parameter (works with OpenLDAP
+			// 2.x.x or later). If it's an LDAP URI, the second parameter, $port, is
+			// ignored, and port must be specified in the full URI. An LDAP URI is of
+			// the form ldap://hostname:port or ldaps://hostname:port.
+			$ldap_host   = $auth_settings['ldap_host'];
+			$ldap_port   = intval( $auth_settings['ldap_port'] );
+			$parsed_host = wp_parse_url( $ldap_host );
+			// Fail (fall back to WordPress auth) if invalid host is specified.
+			if ( false === $parsed_host ) {
+				return null;
+			}
+			// If a scheme is in the LDAP host, use full LDAP URI instead of just hostname.
+			if ( array_key_exists( 'scheme', $parsed_host ) ) {
+				// If the port isn't in the LDAP URI, use the one in the LDAP port field.
+				if ( ! array_key_exists( 'port', $parsed_host ) ) {
+					$parsed_host['port'] = $ldap_port;
+				}
+				$ldap_host = $this->build_url( $parsed_host );
+			}
+
+			// Establish LDAP connection.
+			error_log("Creating ldap client");
+			$ldap = new LdapClient([
+				'servers' => $ldap_host,
+				'port' => $ldap_port
+			]);
+
+			if ( 1 === intval( $auth_settings['ldap_tls'] ) ) {
+				if ( ! $ldap->startTls() ) {
+					error_log("Unable to start tls");
+					return null;
+				}
+			}
+
+			// Set bind credentials; attempt an anonymous bind if not provided.
+			$bind_rdn      = null;
+			$bind_password = null;
+			if ( strlen( $auth_settings['ldap_user'] ) > 0 ) {
+				$bind_rdn      = $auth_settings['ldap_user'];
+				$bind_password = $result = $this->decrypt_compat( $auth_settings['ldap_password'] );
+				if (is_wp_error( $result ))
+					return $result;
+			}
+
+			// Attempt LDAP bind.
+			try {
+				error_log("attempting bind");
+				$ldap->bind($bind_rdn, $bind_password);
+			} catch (BindException $e) {
+			   echo sprintf('Error (%s): %s', $e->getCode(), $e->getMessage());
+			   return null;
+			}
+
+			// Look up the bind DN (and first/last name) of the user trying to
+			// log in by performing an LDAP search for the login username in
+			// the field specified in the LDAP settings. This setup is common.
+			$ldap_attributes_to_retrieve = array( 'dn' );
+			if ( array_key_exists( 'ldap_attr_first_name', $auth_settings ) && strlen( $auth_settings['ldap_attr_first_name'] ) > 0 ) {
+				array_push( $ldap_attributes_to_retrieve, $auth_settings['ldap_attr_first_name'] );
+			}
+			if ( array_key_exists( 'ldap_attr_last_name', $auth_settings ) && strlen( $auth_settings['ldap_attr_last_name'] ) > 0 ) {
+				array_push( $ldap_attributes_to_retrieve, $auth_settings['ldap_attr_last_name'] );
+			}
+			if ( array_key_exists( 'ldap_attr_email', $auth_settings ) && strlen( $auth_settings['ldap_attr_email'] ) > 0 && substr( $auth_settings['ldap_attr_email'], 0, 1 ) !== '@' ) {
+				array_push( $ldap_attributes_to_retrieve, $this->lowercase( $auth_settings['ldap_attr_email'] ) );
+			}
+
+			// Create default LDAP search filter (uid=$username).
+			$search_filter = '(' . $auth_settings['ldap_uid'] . '=' . $username . ')';
+
+			/**
+			 * Filter LDAP search filter.
+			 *
+			 * Allows for custom LDAP authentication rules (e.g., restricting login
+			 * access to users in multiple groups, or having certain attributes).
+			 *
+			 * @param string $search_filter The filter to pass to ldap_search().
+			 * @param string $ldap_uid      The attribute to compare username against (from Authorizer Settings).
+			 * @param string $username      The username attempting to log in.
+			 */
+			$search_filter = apply_filters( 'authorizer_ldap_search_filter', $search_filter, $auth_settings['ldap_uid'], $username );
+
+			// Multiple search bases can be provided, so iterate through them until a match is found.
+			foreach ( $search_bases as $search_base ) {
+				$filter = Filters::raw($search_filter);
+				$ldap_entries = $ldap->search(Operations::list($filter, $search_base, ...$ldap_attributes_to_retrieve));
+				$num_entries = count( $ldap_entries );
+				if ( $num_entries > 0 ) {
+					error_log("no results");
+					break;
+				}
+			}
+
+			// If we didn't find any users in ldap, fall back to WordPress authentication.
+			if ( $num_entries < 1 ) {
+				return null;
+			}
+
+			// Get the bind dn and first/last names; if there are multiple results returned, just get the last one.
+			foreach ($ldap_entries as $entry) {
+				$ldap_user_dn = $entry->getDn();
+
+				// Get user first name and last name.
+				$ldap_attr_first_name = array_key_exists( 'ldap_attr_first_name', $auth_settings ) ? $this->lowercase( $auth_settings['ldap_attr_first_name'] ) : '';
+				if ( strlen( $ldap_attr_first_name ) > 0 && $entry->has( $ldap_attr_first_name ) ) {
+					$first_name = $entry->get( $ldap_attr_first_name );
+				}
+				$ldap_attr_last_name = array_key_exists( 'ldap_attr_last_name', $auth_settings ) ? $this->lowercase( $auth_settings['ldap_attr_last_name'] ) : '';
+				if ( strlen( $ldap_attr_last_name ) > 0 && $entry->has( $ldap_attr_last_name ) ) {
+					$last_name = $entry->get( $ldap_attr_last_name );
+				}
+				// Get user email if it is specified in another field.
+				$ldap_attr_email = array_key_exists( 'ldap_attr_email', $auth_settings ) ? $this->lowercase( $auth_settings['ldap_attr_email'] ) : '';
+				if ( strlen( $ldap_attr_email ) > 0 ) {
+					// If the email attribute starts with an at symbol (@), assume that the
+					// email domain is manually entered there (instead of a reference to an
+					// LDAP attribute), and combine that with the username to create the email.
+					// Otherwise, look up the LDAP attribute for email.
+					if ( substr( $ldap_attr_email, 0, 1 ) === '@' ) {
+						$email = $this->lowercase( $username . $ldap_attr_email );
+					} elseif ( $entry->has( $ldap_attr_email ) ) {
+						$email = $this->lowercase( $entry->get( $ldap_attr_email ) );
+					}
+				}
+			}
+
+			// Attempt LDAP bind.
+			try {
+				$ldap->bind($ldap_user_dn, stripslashes( $password ));
+			} catch (BindException $e) {
+				error_log('bind failed');
+			    echo sprintf('Error (%s): %s', $e->getCode(), $e->getMessage());
+			    return null;
+			}
+
+			// User successfully authenticated against LDAP, so set the relevant variables.
+			$externally_authenticated_email = $this->lowercase( $username . '@' . $domain );
+
+			// If an LDAP attribute has been specified as containing the email address, use that instead.
+			if ( strlen( $email ) > 0 ) {
+				$externally_authenticated_email = $this->lowercase( $email );
+			}
+
+			return array(
+				'email'            => $externally_authenticated_email,
+				'username'         => $username,
+				'first_name'       => $first_name,
+				'last_name'        => $last_name,
+				'authenticated_by' => 'ldap',
+				'ldap_attributes'  => $ldap_entries,
+			);
+		}
+
+		/**
+		 * Validate this user's credentials against LDAP.
+		 *
+		 * @param  array  $auth_settings Plugin settings.
+		 * @param  string $username      Attempted username from authenticate action.
+		 * @param  string $password      Attempted password from authenticate action.
+		 * @return array|WP_Error        Array containing 'email' and 'authenticated_by' strings
+		 *                               for the successfully authenticated user, or WP_Error()
+		 *                               object on failure, or null if skipping LDAP auth and
+		 *                               falling back to WP auth.
+		 */
+		private function custom_authenticate_openldap( $auth_settings, $username, $password ) {
+			// Get LDAP search base(s).
+			$search_bases = explode( "\n", str_replace( "\r", '', trim( $auth_settings['ldap_search_base'] ) ) );
+
+			// Fail silently (fall back to WordPress authentication) if no search base specified.
+			if ( count( $search_bases ) < 1 ) {
+				return null;
+			}
+
+			// Get the FQDN from the first LDAP search base domain components (dc). For
+			// example, ou=people,dc=example,dc=edu,dc=uk would yield user@example.edu.uk.
+			$search_base_components = explode( ',', trim( $search_bases[0] ) );
+			$domain                 = array();
+			foreach ( $search_base_components as $search_base_component ) {
+				$component = explode( '=', $search_base_component );
+				if ( 2 === count( $component ) && 'dc' === $component[0] ) {
+					$domain[] = $component[1];
+				}
+			}
+			$domain = implode( '.', $domain );
+
+			// If we can't get the logging in user's email address from an LDAP attribute,
+			// just use the domain from the LDAP host. This will only be used if we
+			// can't discover the email address from an LDAP attribute.
+			if ( empty( $domain ) ) {
+				$domain = preg_match( '/[^.]*\.[^.]*$/', $auth_settings['ldap_host'], $matches ) === 1 ? $matches[0] : '';
+			}
+
+			// remove @domain if it exists in the username (i.e., if user entered their email).
+			$username = str_replace( '@' . $domain, '', $username );
+
+			// Fail silently (fall back to WordPress authentication) if both username
+			// and password are empty (this will be the case when visiting wp-login.php
+			// for the first time, or when clicking the Log In button without filling
+			// out either field.
+			if ( empty( $username ) && empty( $password ) ) {
+				return null;
+			}
+
+			// Fail with error message if username or password is blank.
+			if ( empty( $username ) ) {
+				return new WP_Error( 'empty_username', __( 'You must provide a username or email.', 'authorizer' ) );
+			}
+			if ( empty( $password ) ) {
+				return new WP_Error( 'empty_password', __( 'You must provide a password.', 'authorizer' ) );
+			}
+
 			// If php5-ldap extension isn't installed on server, fall back to WP auth.
 			if ( ! function_exists( 'ldap_connect' ) ) {
 				return null;
@@ -1463,7 +1688,7 @@ if ( ! class_exists( 'WP_Plugin_Authorizer' ) ) {
 			$bind_password = null;
 			if ( strlen( $auth_settings['ldap_user'] ) > 0 ) {
 				$bind_rdn      = $auth_settings['ldap_user'];
-				$bind_password = $this->decrypt( $auth_settings['ldap_password'] );
+				$bind_password = $this->decrypt_compat( $auth_settings['ldap_password'] );
 			}
 
 			// Attempt LDAP bind.
@@ -3410,8 +3635,9 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Obfuscate LDAP directory user password.
 			if ( strlen( $auth_settings['ldap_password'] ) > 0 ) {
+				error_log('Encrypting password during sanitize_options');
 				// encrypt the directory user password for some minor obfuscation in the database.
-				$auth_settings['ldap_password'] = $this->encrypt( $auth_settings['ldap_password'] );
+				$auth_settings['ldap_password'] = $this->encrypt_compat( $auth_settings['ldap_password'] );
 			}
 
 			// Sanitize LDAP attribute update (checkbox: value can only be '1' or empty string).
@@ -5056,7 +5282,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 			// Print option elements.
 			?>
 			<input type="password" id="garbage_to_stop_autofill" name="garbage" value="" autocomplete="off" style="display:none;" />
-			<input type="password" id="auth_settings_<?php echo esc_attr( $option ); ?>" name="auth_settings[<?php echo esc_attr( $option ); ?>]" value="<?php echo esc_attr( $this->decrypt( $auth_settings_option ) ); ?>" autocomplete="new-password" />
+			<input type="password" id="auth_settings_<?php echo esc_attr( $option ); ?>" name="auth_settings[<?php echo esc_attr( $option ); ?>]" value="<?php echo esc_attr( $this->decrypt_compat( $auth_settings_option ) ); ?>" autocomplete="new-password" />
 			<?php
 		}
 
@@ -7292,6 +7518,35 @@ function signInCallback( authResult ) { // jshint ignore:line
 		 */
 		private static $iv = 'R_O2D]jPn]1[fhJl!-P1.oe';
 
+		function encrypt_compat($data)
+		{
+			$l = strlen(self::$key);
+			if ($l < 16)
+				$key = str_repeat(self::$key, ceil(16/$l));
+	
+			if ($m = strlen($data)%8)
+				$data .= str_repeat("\x00",  8 - $m);
+			if (function_exists('mcrypt_encrypt'))
+				$val = mcrypt_encrypt(MCRYPT_BLOWFISH, self::$key, addslashes($data), MCRYPT_MODE_ECB);
+			else
+				$val = openssl_encrypt(addslashes($data), 'BF-ECB', self::$key, OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
+	
+			return base64_encode($val);
+		}
+	
+		function decrypt_compat($data)
+		{
+			$l = strlen(self::$key);
+			if ($l < 16)
+				$key = str_repeat(self::$key, ceil(16/$l));
+	
+			if (function_exists('mcrypt_encrypt'))
+				$val = mcrypt_decrypt(MCRYPT_BLOWFISH, self::$key, base64_decode($data), MCRYPT_MODE_ECB);
+			else
+				$val = openssl_decrypt(base64_decode($data), 'BF-ECB', self::$key, OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
+			return stripslashes($val);
+		}
+
 		/**
 		 * Basic encryption using a public (not secret!) key. Used for general
 		 * database obfuscation of passwords.
@@ -7305,6 +7560,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Use openssl library (better) if it is enabled.
 			if ( function_exists( 'openssl_encrypt' ) && 'openssl' === $library ) {
+				error_log('Encrypting using openssl');
 				$result = base64_encode(
 					openssl_encrypt(
 						$text,
@@ -7315,8 +7571,10 @@ function signInCallback( authResult ) { // jshint ignore:line
 					)
 				);
 			} elseif ( function_exists( 'mcrypt_encrypt' ) ) { // Use mcrypt library (deprecated in PHP 7.1) if php5-mcrypt extension is enabled.
+				error_log('Encrypting using mcrypt');
 				$result = base64_encode( mcrypt_encrypt( MCRYPT_RIJNDAEL_256, self::$key, $text, MCRYPT_MODE_ECB, 'abcdefghijklmnopqrstuvwxyz012345' ) );
 			} else { // Fall back to basic obfuscation.
+				error_log('Encrypting using basic authentication');
 				$length = strlen( $text );
 				for ( $i = 0; $i < $length; $i++ ) {
 					$char    = substr( $text, $i, 1 );
@@ -7344,6 +7602,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 
 			// Use openssl library (better) if it is enabled.
 			if ( function_exists( 'openssl_decrypt' ) && 'openssl' === $library ) {
+				error_log('Decrypting using openssl');
 				$result = openssl_decrypt(
 					base64_decode( $secret ),
 					'AES-256-CBC',
@@ -7352,9 +7611,11 @@ function signInCallback( authResult ) { // jshint ignore:line
 					substr( hash( 'sha256', self::$iv ), 0, 16 )
 				);
 			} elseif ( function_exists( 'mcrypt_decrypt' ) ) { // Use mcrypt library (deprecated in PHP 7.1) if php5-mcrypt extension is enabled.
+				error_log('Decrypting using mcrypt');
 				$secret = base64_decode( $secret );
 				$result = rtrim( mcrypt_decrypt( MCRYPT_RIJNDAEL_256, self::$key, $secret, MCRYPT_MODE_ECB, 'abcdefghijklmnopqrstuvwxyz012345' ), "\0$result" );
 			} else { // Fall back to basic obfuscation.
+				error_log('Decrypting using basic authentication');
 				$secret = base64_decode( $secret );
 				$length = strlen( $secret );
 				for ( $i = 0; $i < $length; $i++ ) {
@@ -7872,7 +8133,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 						$auth_settings = get_blog_option( $blog_id, 'auth_settings', array() );
 						if ( array_key_exists( 'ldap_password', $auth_settings ) && strlen( $auth_settings['ldap_password'] ) > 0 ) {
 							$plaintext_ldap_password        = $this->decrypt( $auth_settings['ldap_password'], 'mcrypt' );
-							$auth_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
+							$auth_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
 							update_blog_option( $blog_id, 'auth_settings', $auth_settings );
 						}
 					}
@@ -7881,7 +8142,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 					$auth_settings = get_option( 'auth_settings', array() );
 					if ( array_key_exists( 'ldap_password', $auth_settings ) && strlen( $auth_settings['ldap_password'] ) > 0 ) {
 						$plaintext_ldap_password        = $this->decrypt( $auth_settings['ldap_password'], 'mcrypt' );
-						$auth_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
+						$auth_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
 						update_option( 'auth_settings', $auth_settings );
 					}
 				}
@@ -7900,7 +8161,7 @@ function signInCallback( authResult ) { // jshint ignore:line
 					$auth_multisite_settings = get_blog_option( $this->current_site_blog_id, 'auth_multisite_settings', array() );
 					if ( array_key_exists( 'ldap_password', $auth_multisite_settings ) && strlen( $auth_multisite_settings['ldap_password'] ) > 0 ) {
 						$plaintext_ldap_password                  = $this->decrypt( $auth_multisite_settings['ldap_password'], 'mcrypt' );
-						$auth_multisite_settings['ldap_password'] = $this->encrypt( $plaintext_ldap_password );
+						$auth_multisite_settings['ldap_password'] = $this->encrypt_compat( $plaintext_ldap_password );
 						update_blog_option( $this->current_site_blog_id, 'auth_multisite_settings', $auth_multisite_settings );
 					}
 				}
